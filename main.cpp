@@ -30,7 +30,7 @@ void DrawData(cv::Mat frame, const std::vector<TrackingObject>& tracks, int fram
 	{
 		const auto& track = tracks[i];
 
-        std::cout << "track: rrect [" << track.m_rrect.size << " from " << track.m_rrect.center << ", " << track.m_rrect.angle << "]" << std::endl;
+        //std::cout << "track: rrect [" << track.m_rrect.size << " from " << track.m_rrect.center << ", " << track.m_rrect.angle << "]" << std::endl;
 
 		if (track.IsRobust(2,             // Minimal trajectory size
 			0.1f,                         // Minimal ratio raw_trajectory_points / trajectory_lenght
@@ -157,12 +157,13 @@ int main(int argc, char** argv)
     trackerSettings.m_minAreaRadiusK = 0.8f;
     trackerSettings.m_useAbandonedDetection = false;
     trackerSettings.m_maximumAllowedLostTime = 10.;       // Maximum allowed lost time
-    trackerSettings.m_maxTraceLength = 10.;               // Maximum trace length
+    trackerSettings.m_maxTraceLength = 20.;               // Maximum trace length
     std::unique_ptr<BaseTracker> tracker = BaseTracker::CreateTracker(trackerSettings, fps);
     
 
     cv::VideoWriter writer;
-
+    if (!outFile.empty())
+        writer.open(outFile, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, frame.size(), true);
 
     time_point_t startTimeStamp = std::chrono::system_clock::now();
     double freq = cv::getTickFrequency();
@@ -179,10 +180,10 @@ int main(int argc, char** argv)
             std::cerr << "Frame " << framesCounter << " is empty" << std::endl;
             break;
         }
-        capture.set(cv::CAP_PROP_POS_FRAMES, framesCounter + readPeriodFrames);
 
         std::chrono::time_point<std::chrono::system_clock> currTime = startTimeStamp + std::chrono::milliseconds(cvRound(framesCounter * (1000 / fps)));
 
+        // Detect on each readPeriodFrames
         int64 t1 = cv::getTickCount();
 
         cv::UMat um = frame.getUMat(cv::ACCESS_READ);
@@ -196,22 +197,73 @@ int main(int argc, char** argv)
         int64 t2 = cv::getTickCount();
         int workTime = cvRound(1000 * (t2 - t1) / freq);
 
-        DrawData(frame, tracks, framesCounter, workTime);
-        detector->CalcMotionMap(frame);
-
-        cv::imshow("Video", frame);
-        int k = cv::waitKey(0);
-        if (k == 27)
-            break;
-
-        if (!outFile.empty())
+        // Interpolate trajectories between framesCounter and framesCounter+readPeriodFrames
+        std::vector<TrackingObject> tmpTracks;
+        tmpTracks.reserve(tracks.size());
+        for (auto& track : tracks)
         {
-            if (!writer.isOpened())
+			tmpTracks.emplace_back(track);
+            tmpTracks.back().m_trace.pop_back();
+        }
+
+        auto Lerp = [](auto from, auto to, auto val)
+        {
+            return from + val * (to - from);
+        };
+
+        int k = 0;
+
+        capture.set(cv::CAP_PROP_POS_FRAMES, framesCounter + 1);
+        for (int fi = 0; fi < readPeriodFrames; ++fi)
+        {
+            cv::Mat tmpFrame;
+            capture >> tmpFrame;
+            if (tmpFrame.empty())
+                break;
+
+            float k = static_cast<float>(fi) / static_cast<float>(readPeriodFrames);
+            std::chrono::time_point<std::chrono::system_clock> frameTime = currTime + std::chrono::milliseconds(cvRound(fi * (1000 / fps)));
+
+            for (size_t i = 0; i < tracks.size(); ++i)
             {
-                writer.open(outFile, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, frame.size(), true);
+                const auto& track = tracks[i];
+                auto& tmpTrack = tmpTracks[i];
+                
+                if (track.m_trace.size() > 1)
+                {
+                    auto pt1 = track.m_trace[track.m_trace.size() - 2];
+                    auto pt2 = track.m_trace[track.m_trace.size() - 1];
+
+                    Point_t pt(Lerp(pt1.x, pt2.x, k), Lerp(pt1.y, pt2.y, k));
+                    tmpTrack.m_trace.push_back(pt, pt, frameTime);
+
+                    tmpTrack.m_rrect = cv::RotatedRect(pt, track.m_rrect.size, track.m_rrect.angle);
+                }
             }
+
+            DrawData(tmpFrame, tmpTracks, framesCounter + fi, 0);
+            //detector->CalcMotionMap(frame);
+
             if (writer.isOpened())
-                writer << frame;
+                writer << tmpFrame;
+            cv::imshow("Video", tmpFrame);
+            k = cv::waitKey(1);
+            if (k == 27)
+                break;
+        }
+
+        DrawData(frame, tracks, framesCounter, workTime);
+        //detector->CalcMotionMap(frame);
+
+        if (writer.isOpened())
+            writer << frame;
+
+        if (k != 27)
+        {
+            cv::imshow("Video", frame);
+            k = cv::waitKey(1);
+            if (k == 27)
+                break;
         }
     }
 
